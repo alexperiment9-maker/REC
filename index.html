@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>REC</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#000000">
+<style>
+body{margin:0;background:#0b0b0b;color:#9f9;font-family:monospace;padding:16px}
+button{font-family:monospace;background:#111;color:#9f9;border:1px solid #9f9;padding:12px;font-size:16px}
+#rec{width:100%;font-size:28px;padding:24px;margin:12px 0}
+#rec.on{background:#300;color:#f55;border-color:#f55}
+#t{font-size:32px;text-align:center;margin-top:12px}
+ul{padding:0}li{list-style:none;border-bottom:1px solid #222;padding:8px 0}
+small{color:#686}
+</style>
+</head>
+<body>
+<div>STATUS: <span id="st">IDLE</span></div>
+<button id="auth">CONNECT DRIVE</button>
+<div id="t">00:00</div>
+<button id="rec">REC</button>
+<ul id="list"></ul>
+<script src="https://accounts.google.com/gsi/client" async></script>
+<script>
+const CLIENT_ID='PASTE_YOUR_CLIENT_ID.apps.googleusercontent.com';
+const FOLDER_NAME='REC';
+let token=null,folderId=null,mr=null,chunks=[],t0=0,timer=null;
+const $=id=>document.getElementById(id);
+const st=s=>$('st').textContent=s;
+
+// ---- local storage (IndexedDB) ----
+const dbp=new Promise(res=>{const o=indexedDB.open('rec',1);o.onupgradeneeded=()=>o.result.createObjectStore('f',{keyPath:'name'});o.onsuccess=()=>res(o.result);});
+async function tx(mode,fn){const db=await dbp;return new Promise((res,rej)=>{const r=fn(db.transaction('f',mode).objectStore('f'));r.onsuccess=()=>res(r.result);r.onerror=rej;});}
+const put=o=>tx('readwrite',s=>s.put(o));
+const all=()=>tx('readonly',s=>s.getAll());
+
+// ---- Google Drive ----
+$('auth').onclick=()=>{
+  google.accounts.oauth2.initTokenClient({client_id:CLIENT_ID,scope:'https://www.googleapis.com/auth/drive.file',
+    callback:async r=>{token=r.access_token;folderId=await getFolder();st('DRIVE OK');flush();}}).requestAccessToken();
+};
+async function api(url,opt={}){opt.headers=Object.assign({Authorization:'Bearer '+token},opt.headers||{});const r=await fetch(url,opt);if(!r.ok)throw new Error(r.status);return r.json();}
+async function getFolder(){
+  const q=encodeURIComponent(`name='${FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
+  const r=await api('https://www.googleapis.com/drive/v3/files?q='+q);
+  if(r.files.length)return r.files[0].id;
+  const f=await api('https://www.googleapis.com/drive/v3/files',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:FOLDER_NAME,mimeType:'application/vnd.google-apps.folder'})});
+  return f.id;
+}
+async function upload(name,blob){
+  const fd=new FormData();
+  fd.append('metadata',new Blob([JSON.stringify({name,parents:[folderId]})],{type:'application/json'}));
+  fd.append('file',blob);
+  return api('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',{method:'POST',body:fd});
+}
+async function flush(){
+  if(!token||!folderId)return;
+  for(const f of await all()){
+    if(f.up)continue;
+    try{st('UPLOADING '+f.name);await upload(f.name,f.blob);f.up=true;await put(f);}
+    catch(e){st('UPLOAD FAIL '+e.message+' (tap CONNECT DRIVE)');return;}
+  }
+  st('SYNCED');render();
+}
+
+// ---- recording ----
+$('rec').onclick=async()=>{
+  if(mr&&mr.state==='recording'){mr.stop();return;}
+  const s=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+  mr=new MediaRecorder(s);chunks=[];
+  mr.ondataavailable=e=>chunks.push(e.data);
+  mr.onstop=async()=>{
+    s.getTracks().forEach(x=>x.stop());clearInterval(timer);
+    $('rec').classList.remove('on');$('rec').textContent='REC';st('ENCODING');
+    const wav=await toWav(new Blob(chunks));
+    const name='REC_'+new Date().toISOString().replace(/[:.]/g,'-').slice(0,19)+'.wav';
+    await put({name,blob:wav,up:false});render();flush();
+  };
+  mr.start();t0=Date.now();
+  $('rec').classList.add('on');$('rec').textContent='STOP';st('RECORDING');
+  timer=setInterval(()=>{const x=Math.floor((Date.now()-t0)/1000);$('t').textContent=String(x/60|0).padStart(2,'0')+':'+String(x%60).padStart(2,'0');},250);
+};
+
+// ---- convert to 16-bit WAV ----
+async function toWav(blob){
+  const ac=new AudioContext();const b=await ac.decodeAudioData(await blob.arrayBuffer());ac.close();
+  const ch=b.numberOfChannels,len=b.length,sr=b.sampleRate,size=len*ch*2;
+  const buf=new ArrayBuffer(44+size),v=new DataView(buf);
+  const w=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));};
+  w(0,'RIFF');v.setUint32(4,36+size,true);w(8,'WAVE');w(12,'fmt ');
+  v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,ch,true);v.setUint32(24,sr,true);
+  v.setUint32(28,sr*ch*2,true);v.setUint16(32,ch*2,true);v.setUint16(34,16,true);w(36,'data');v.setUint32(40,size,true);
+  const d=[];for(let c=0;c<ch;c++)d.push(b.getChannelData(c));
+  let o=44;for(let i=0;i<len;i++)for(let c=0;c<ch;c++){const x=Math.max(-1,Math.min(1,d[c][i]));v.setInt16(o,x<0?x*0x8000:x*0x7FFF,true);o+=2;}
+  return new Blob([buf],{type:'audio/wav'});
+}
+
+// ---- file list ----
+async function render(){
+  const fs=(await all()).sort((a,b)=>b.name.localeCompare(a.name));
+  $('list').innerHTML='';
+  for(const f of fs){
+    const li=document.createElement('li');
+    li.innerHTML=`${f.name} <small>${f.up?'[SYNCED]':'[PENDING]'}</small><br>`;
+    const p=document.createElement('button');p.textContent='PLAY';p.onclick=()=>new Audio(URL.createObjectURL(f.blob)).play();
+    const d=document.createElement('button');d.textContent='DEL';d.onclick=async()=>{if(confirm('Delete phone copy? (Drive copy stays)')){await tx('readwrite',s=>s.delete(f.name));render();}};
+    li.append(p,' ',d);$('list').append(li);
+  }
+}
+render();
+if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js');
+</script>
+</body>
+</html>
