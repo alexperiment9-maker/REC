@@ -10,10 +10,25 @@
 *{box-sizing:border-box}
 [hidden]{display:none!important}
 body{margin:0;background:#0b0b0b;color:#9f9;font-family:monospace;padding:16px 16px 190px}
-button{font-family:monospace;background:#111;color:#9f9;border:1px solid #9f9;padding:12px;font-size:16px}
+button,input[type=text],input[type=number]{font-family:monospace;background:#111;color:#9f9;border:1px solid #9f9;padding:12px;font-size:16px;border-radius:0}
 #rec{width:100%;font-size:28px;padding:24px;margin:12px 0}
 #rec.on{background:#300;color:#f55;border-color:#f55}
+#rec.cnt{background:#320;color:#fc5;border-color:#fc5}
 #t{font-size:32px;text-align:center;margin-top:12px}
+#info{text-align:center;color:#686;font-size:12px;min-height:16px}
+#meter{position:relative;height:24px;border:1px solid #9f9;background:#111;margin-top:8px;cursor:pointer}
+#bar{position:absolute;left:0;top:0;bottom:0;width:0;background:#9f9}
+#bar.hot{background:#fc5}
+#meterTxt{position:absolute;right:6px;top:3px;font-size:13px;color:#fff;mix-blend-mode:difference}
+#meter.clip{border-color:#f55}
+#meter.clip #meterTxt{color:#f55;mix-blend-mode:normal;font-weight:bold}
+#take{width:100%;margin-top:10px}
+#opts{display:flex;gap:6px;margin-top:6px;align-items:stretch}
+#opts label{display:flex;align-items:center;gap:6px;font-size:14px}
+#bpm{width:76px;padding:12px 6px}
+#opts button{flex:1;padding:12px 2px;font-size:14px;min-width:0;color:#686;border-color:#686}
+#opts button.act{color:#000;background:#9f9;border-color:#9f9}
+#hint{color:#686;font-size:12px;margin-top:4px}
 ul{padding:0}li{list-style:none;border-bottom:1px solid #222;padding:8px 0}
 li.cur .nm{color:#fff}
 .nm{overflow-wrap:anywhere}
@@ -30,6 +45,15 @@ small{color:#686}
 <div>STATUS: <span id="st">IDLE</span></div>
 <button id="auth">CONNECT DRIVE</button>
 <div id="t">00:00</div>
+<div id="info"></div>
+<div id="meter" title="Tap to clear CLIP"><div id="bar"></div><div id="meterTxt">LEVEL</div></div>
+<input id="take" type="text" maxlength="40" placeholder="TAKE NAME (OPTIONAL)" aria-label="Take name" autocomplete="off">
+<div id="opts">
+  <label>BPM <input id="bpm" type="number" min="30" max="300" inputmode="numeric" value="120"></label>
+  <button id="optCount">COUNT-IN</button>
+  <button id="optClick">METRONOME</button>
+</div>
+<div id="hint">USE HEADPHONES WITH COUNT-IN / METRONOME, OR THE MIC WILL RECORD THE CLICK</div>
 <button id="rec">REC</button>
 <ul id="list"></ul>
 <div id="pl" hidden>
@@ -49,24 +73,55 @@ small{color:#686}
 <script>
 const CLIENT_ID='565577680506-j8u91f1tumfhvgne4ndv18djdsd86g38.apps.googleusercontent.com';
 const FOLDER_NAME='REC';
-let token=null,folderId=null,mr=null,chunks=[],t0=0,timer=null,memSerial=0;
 const $=id=>document.getElementById(id);
 const st=s=>$('st').textContent=s;
 const pad=(n,w=2)=>String(n).padStart(w,'0');
 const clock=s=>{s=Math.max(0,Math.floor(s||0));return pad(s/60|0)+':'+pad(s%60);};
+const lsGet=k=>{try{return localStorage.getItem(k);}catch(e){return null;}};
+const lsSet=(k,v)=>{try{localStorage.setItem(k,v);}catch(e){}};
+const lsDel=k=>{try{localStorage.removeItem(k);}catch(e){}};
+const within=(p,ms,fb)=>Promise.race([p,new Promise(r=>setTimeout(()=>r(fb),ms))]);
+let state='idle'; // idle | arming | count | rec | saving
+const note=s=>{if(state==='idle')st(s);};
 
-// ---- local storage (IndexedDB) ----
-const dbp=new Promise(res=>{const o=indexedDB.open('rec',1);o.onupgradeneeded=()=>o.result.createObjectStore('f',{keyPath:'name'});o.onsuccess=()=>res(o.result);});
-async function tx(mode,fn){const db=await dbp;return new Promise((res,rej)=>{const r=fn(db.transaction('f',mode).objectStore('f'));r.onsuccess=()=>res(r.result);r.onerror=rej;});}
+// ---- local storage (IndexedDB): f = finished files, chunks + sess = recording in progress ----
+const dbp=new Promise((res,rej)=>{
+  const o=indexedDB.open('rec',2);
+  o.onupgradeneeded=()=>{
+    const d=o.result;
+    if(!d.objectStoreNames.contains('f'))d.createObjectStore('f',{keyPath:'name'});
+    if(!d.objectStoreNames.contains('chunks'))d.createObjectStore('chunks',{keyPath:['sid','i']});
+    if(!d.objectStoreNames.contains('sess'))d.createObjectStore('sess',{keyPath:'sid'});
+  };
+  o.onblocked=()=>st('CLOSE OTHER REC TABS, THEN REOPEN');
+  o.onsuccess=()=>res(o.result);
+  o.onerror=()=>rej(o.error);
+});
+async function tx(mode,fn,store='f'){const db=await dbp;return new Promise((res,rej)=>{const r=fn(db.transaction(store,mode).objectStore(store));r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});}
 const put=o=>tx('readwrite',s=>s.put(o));
 const all=()=>tx('readonly',s=>s.getAll());
+const chunkRange=sid=>IDBKeyRange.bound([sid,0],[sid,Infinity]);
+const dropSession=async sid=>{const db=await dbp;return new Promise((res,rej)=>{const t=db.transaction(['chunks','sess'],'readwrite');t.objectStore('chunks').delete(chunkRange(sid));t.objectStore('sess').delete(sid);t.oncomplete=res;t.onerror=t.onabort=()=>rej(t.error);});};
 
-// ---- Google Drive ----
-$('auth').onclick=()=>{
+// ---- Google Drive: login is remembered, and refreshed when you tap STOP after it expires ----
+let token=null,tokenExp=0,folderId=null,flushing=false,again=false;
+const tokenOK=()=>token&&Date.now()<tokenExp-60000;
+function driveLabel(){$('auth').textContent=tokenOK()?'DRIVE CONNECTED':'CONNECT DRIVE';}
+function clearToken(){token=null;tokenExp=0;lsDel('rec_token');driveLabel();}
+function connect(silent){
+  if(!window.google||!google.accounts){st('GOOGLE LOGIN NOT LOADED - CHECK INTERNET');return;}
   google.accounts.oauth2.initTokenClient({client_id:CLIENT_ID,scope:'https://www.googleapis.com/auth/drive.file',
-    callback:async r=>{token=r.access_token;folderId=await getFolder();st('DRIVE OK');flush();}}).requestAccessToken();
-};
-async function api(url,opt={}){opt.headers=Object.assign({Authorization:'Bearer '+token},opt.headers||{});const r=await fetch(url,opt);if(!r.ok)throw new Error(r.status);return r.json();}
+    callback:async r=>{
+      if(!r||r.error||!r.access_token){note('DRIVE LOGIN FAILED - TAP CONNECT DRIVE');return;}
+      token=r.access_token;tokenExp=Date.now()+(+r.expires_in||3600)*1000;
+      lsSet('rec_token',JSON.stringify({t:token,e:tokenExp}));lsSet('rec_connected','1');driveLabel();
+      try{folderId=await getFolder();note('DRIVE OK');flush();}catch(e){note('DRIVE ERROR '+e.message);}
+    },
+    error_callback:()=>note('DRIVE LOGIN CANCELLED - TAP CONNECT DRIVE')
+  }).requestAccessToken(silent?{prompt:''}:{});
+}
+$('auth').onclick=()=>connect(lsGet('rec_connected')==='1');
+async function api(url,opt={}){opt.headers=Object.assign({Authorization:'Bearer '+token},opt.headers||{});const r=await fetch(url,opt);if(r.status===401)clearToken();if(!r.ok)throw new Error(r.status);return r.json();}
 async function getFolder(){
   const q=encodeURIComponent(`name='${FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
   const r=await api('https://www.googleapis.com/drive/v3/files?q='+q);
@@ -74,30 +129,49 @@ async function getFolder(){
   const f=await api('https://www.googleapis.com/drive/v3/files',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:FOLDER_NAME,mimeType:'application/vnd.google-apps.folder'})});
   return f.id;
 }
+// Resumable upload handles big takes; multipart is the fallback.
 async function upload(f){
   const meta={name:f.name,parents:[folderId]};
   if(f.loc)meta.description='Location: '+(f.loc.place?f.loc.place+' | ':'')+f.loc.lat+', '+f.loc.lon;
+  const init=await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable',{method:'POST',
+    headers:{Authorization:'Bearer '+token,'Content-Type':'application/json; charset=UTF-8','X-Upload-Content-Type':'audio/wav','X-Upload-Content-Length':String(f.blob.size)},
+    body:JSON.stringify(meta)});
+  if(init.status===401)clearToken();
+  if(!init.ok)throw new Error(init.status);
+  const loc=init.headers.get('Location');
+  if(loc){
+    const r=await fetch(loc,{method:'PUT',headers:{'Content-Type':'audio/wav'},body:f.blob});
+    if(!r.ok)throw new Error(r.status);
+    return;
+  }
   const fd=new FormData();
   fd.append('metadata',new Blob([JSON.stringify(meta)],{type:'application/json'}));
   fd.append('file',f.blob);
   return api('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',{method:'POST',body:fd});
 }
 async function flush(){
-  if(!token||!folderId)return;
-  for(const f of await all()){
-    if(f.up)continue;
-    try{st('UPLOADING '+f.name);await upload(f);f.up=true;await put(f);await render();}
-    catch(e){st('UPLOAD FAIL '+e.message+' (tap CONNECT DRIVE)');return;}
-  }
-  st('SYNCED');render();
+  if(!tokenOK()||!folderId)return;
+  if(flushing){again=true;return;}
+  flushing=true;
+  try{
+    do{
+      again=false;
+      for(const f of await all()){
+        if(f.up)continue;
+        note('UPLOADING '+f.name);await upload(f);f.up=true;await put(f);await render();
+      }
+    }while(again);
+    note('SYNCED');
+  }catch(e){note('UPLOAD FAIL '+e.message+' - TAP CONNECT DRIVE');}
+  finally{flushing=false;}
 }
+addEventListener('online',flush);
 
 // ---- serial number: continues from the highest number on this device or in Drive ----
+let memSerial=0;
 const serialOf=n=>{const m=/^(\d+)_/.exec(n);return m?+m[1]:0;};
-function savedSerial(){try{return +localStorage.getItem('rec_serial')||0;}catch(e){return 0;}}
-function saveSerial(n){memSerial=n;try{localStorage.setItem('rec_serial',String(n));}catch(e){}}
 async function driveMax(){
-  if(!token||!folderId)return 0;
+  if(!tokenOK()||!folderId)return 0;
   let max=0,page='';
   const q=encodeURIComponent(`'${folderId}' in parents and trashed=false`);
   do{
@@ -107,12 +181,11 @@ async function driveMax(){
   }while(page);
   return max;
 }
-const within=(p,ms,fb)=>Promise.race([p,new Promise(r=>setTimeout(()=>r(fb),ms))]);
 async function nextSerial(){
-  let max=Math.max(savedSerial(),memSerial);
+  let max=Math.max(+lsGet('rec_serial')||0,memSerial);
   for(const f of await all())max=Math.max(max,serialOf(f.name));
   max=Math.max(max,await within(driveMax().catch(()=>0),4000,0));
-  saveSerial(max+1);
+  memSerial=max+1;lsSet('rec_serial',String(max+1));
   return max+1;
 }
 
@@ -131,52 +204,223 @@ function getLoc(){return new Promise(res=>{
     res({lat,lon,place});
   },()=>res(null),{timeout:8000,maximumAge:300000});
 });}
+const clean=s=>(s||'').replace(/[^A-Za-z0-9]+/g,'-').replace(/^-|-$/g,'');
 function locLabel(l){
   if(!l)return 'NoLocation';
-  const p=(l.place||'').replace(/[^A-Za-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,40);
+  const p=clean(l.place).slice(0,40);
   if(p)return p;
   return Math.abs(l.lat)+(l.lat<0?'S':'N')+'-'+Math.abs(l.lon)+(l.lon<0?'W':'E');
 }
 function stamp(d){return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;}
-
-// ---- recording ----
-let locP=null,startedAt=null;
-$('rec').onclick=async()=>{
-  if(mr&&mr.state==='recording'){mr.stop();return;}
-  let s;
-  try{s=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});}
-  catch(e){st('MIC BLOCKED: '+e.message);return;}
-  mr=new MediaRecorder(s);chunks=[];startedAt=new Date();locP=getLoc();
-  mr.ondataavailable=e=>chunks.push(e.data);
-  mr.onstop=async()=>{
-    s.getTracks().forEach(x=>x.stop());clearInterval(timer);
-    $('rec').classList.remove('on');$('rec').textContent='REC';st('ENCODING');
-    try{
-      const wav=await toWav(new Blob(chunks));
-      const loc=await within(locP,10000,null);
-      const name=pad(await nextSerial(),4)+'_'+stamp(startedAt)+'_'+locLabel(loc)+'.wav';
-      await put({name,blob:wav,up:false,loc});await render();
-      if(token&&folderId)flush();else st('SAVED ON DEVICE - TAP CONNECT DRIVE');
-    }catch(e){st('ENCODE FAIL: '+e.message);}
-  };
-  mr.start();t0=Date.now();
-  $('rec').classList.add('on');$('rec').textContent='STOP';st('RECORDING');
-  timer=setInterval(()=>{$('t').textContent=clock((Date.now()-t0)/1000);},250);
-};
-
-// ---- convert to 16-bit WAV ----
-async function toWav(blob){
-  const ac=new AudioContext();const b=await ac.decodeAudioData(await blob.arrayBuffer());ac.close();
-  const ch=b.numberOfChannels,len=b.length,sr=b.sampleRate,size=len*ch*2;
-  const buf=new ArrayBuffer(44+size),v=new DataView(buf);
-  const w=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));};
-  w(0,'RIFF');v.setUint32(4,36+size,true);w(8,'WAVE');w(12,'fmt ');
-  v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,ch,true);v.setUint32(24,sr,true);
-  v.setUint32(28,sr*ch*2,true);v.setUint16(32,ch*2,true);v.setUint16(34,16,true);w(36,'data');v.setUint32(40,size,true);
-  const d=[];for(let c=0;c<ch;c++)d.push(b.getChannelData(c));
-  let o=44;for(let i=0;i<len;i++)for(let c=0;c<ch;c++){const x=Math.max(-1,Math.min(1,d[c][i]));v.setInt16(o,x<0?x*0x8000:x*0x7FFF,true);o+=2;}
-  return new Blob([buf],{type:'audio/wav'});
+function fileName(serial,s,recovered){
+  const take=clean(s.take).slice(0,40);
+  return pad(serial,4)+'_'+stamp(new Date(s.startedAt))+'_'+locLabel(s.loc)+(take?'_'+take:'')+(recovered?'_RECOVERED':'')+'.wav';
 }
+
+// ---- options ----
+let optCount=lsGet('rec_count')==='1',optClick=lsGet('rec_click')==='1';
+$('bpm').value=+lsGet('rec_bpm')||120;
+function showOpts(){$('optCount').classList.toggle('act',optCount);$('optClick').classList.toggle('act',optClick);}
+$('optCount').onclick=()=>{optCount=!optCount;lsSet('rec_count',optCount?'1':'0');showOpts();};
+$('optClick').onclick=()=>{optClick=!optClick;lsSet('rec_click',optClick?'1':'0');showOpts();};
+const getBpm=()=>{const b=Math.max(30,Math.min(300,+$('bpm').value||120));$('bpm').value=b;lsSet('rec_bpm',String(b));return b;};
+showOpts();
+
+// ---- level meter ----
+let clipped=false;
+function showLevel(p){
+  const db=p>0?20*Math.log10(p):-90;
+  const w=Math.max(0,Math.min(100,(db+60)/60*100));
+  $('bar').style.width=w+'%';
+  $('bar').classList.toggle('hot',db>-6);
+  if(p>=0.999){clipped=true;$('meter').classList.add('clip');}
+  $('meterTxt').textContent=clipped?'CLIP - TOO LOUD':(db<=-60?'-INF':db.toFixed(0)+' DB');
+}
+function clearClip(){clipped=false;$('meter').classList.remove('clip');$('meterTxt').textContent='LEVEL';}
+$('meter').onclick=clearClip;
+
+// ---- screen stays on while recording ----
+let wake=null,wakeOK=false;
+async function holdScreen(){
+  try{wake=await navigator.wakeLock.request('screen');wakeOK=true;wake.addEventListener('release',()=>{wake=null;});}
+  catch(e){wakeOK=false;}
+  showInfo();
+}
+function freeScreen(){if(wake){wake.release().catch(()=>{});wake=null;}}
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&(state==='rec'||state==='count'))holdScreen();});
+
+// ---- raw recording: samples go straight to 24-bit WAV, saved to the device every second ----
+const WORKLET=`class R extends AudioWorkletProcessor{
+constructor(){super();this.when=Infinity;this.n=0;this.buf=null;this.peak=0;this.m=0;this.dead=false;
+this.port.onmessage=e=>{if(e.data==='stop'){this.send();this.port.postMessage({done:true});this.dead=true;}else if(e.data&&e.data.when!==undefined)this.when=e.data.when;};}
+send(){if(this.buf&&this.n){const d=this.buf.map(b=>b.slice(0,this.n));this.port.postMessage({data:d},d.map(x=>x.buffer));}this.n=0;}
+process(inp){if(this.dead)return false;const i=inp[0];if(!i||!i.length)return true;
+for(const c of i)for(let k=0;k<c.length;k++){const a=Math.abs(c[k]);if(a>this.peak)this.peak=a;}
+this.m+=i[0].length;if(this.m>=2048){this.port.postMessage({peak:this.peak});this.peak=0;this.m=0;}
+if(currentTime>=this.when){if(!this.buf)this.buf=i.map(()=>new Float32Array(4096));
+if(this.n+i[0].length>4096)this.send();
+for(let ch=0;ch<this.buf.length;ch++)this.buf[ch].set(i[ch]||i[0],this.n);
+this.n+=i[0].length;}
+return true;}}
+registerProcessor('r',R);`;
+let R=null; // current recording
+function showInfo(){
+  const parts=[];
+  if(R&&R.sess.sr)parts.push((R.sess.sr/1000)+' KHZ 24-BIT '+(R.sess.ch===1?'MONO':R.sess.ch===2?'STEREO':R.sess.ch+'CH'));
+  if(state==='rec'||state==='count')parts.push(wakeOK?'SCREEN HELD ON':'KEEP SCREEN ON MANUALLY');
+  $('info').textContent=parts.join(' | ');
+}
+function wavHeader(bytes,sr,ch){
+  const b=new ArrayBuffer(44),v=new DataView(b);
+  const w=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));};
+  w(0,'RIFF');v.setUint32(4,36+bytes,true);w(8,'WAVE');w(12,'fmt ');
+  v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,ch,true);v.setUint32(24,sr,true);
+  v.setUint32(28,sr*ch*3,true);v.setUint16(32,ch*3,true);v.setUint16(34,24,true);w(36,'data');v.setUint32(40,bytes,true);
+  return b;
+}
+function toInt24(d){
+  const ch=d.length,n=d[0].length,u=new Uint8Array(n*ch*3);
+  let o=0;
+  for(let i=0;i<n;i++)for(let c=0;c<ch;c++){
+    let x=Math.round(Math.max(-1,Math.min(1,d[c][i]))*8388607);
+    u[o++]=x&255;u[o++]=(x>>8)&255;u[o++]=(x>>16)&255;
+  }
+  return u;
+}
+function commitBatch(r){
+  if(!r.batch.length)return;
+  const blob=new Blob(r.batch);r.batch=[];r.batchBytes=0;
+  const rec={sid:r.sid,i:r.idx++,blob};
+  r.pending=r.pending.then(()=>tx('readwrite',s=>s.put(rec),'chunks')).catch(e=>{r.err=e;st('STORAGE ERROR: '+e.message);});
+}
+function onWorklet(r,m){
+  if(m.peak!==undefined)showLevel(m.peak);
+  if(m.data){
+    if(!r.sess.sr){r.sess.sr=r.ac.sampleRate;r.sess.ch=m.data.length;tx('readwrite',s=>s.put(r.sess),'sess').catch(()=>{});showInfo();}
+    const u=toInt24(m.data);r.batch.push(u);r.batchBytes+=u.length;
+    if(r.batchBytes>=r.ac.sampleRate*m.data.length*3)commitBatch(r);
+  }
+  if(m.done&&r.doneFn)r.doneFn();
+}
+function beep(ac,t,hi){
+  const o=ac.createOscillator(),g=ac.createGain();
+  o.frequency.value=hi?1600:1000;
+  g.gain.setValueAtTime(0.5,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.05);
+  o.connect(g);g.connect(ac.destination);o.start(t);o.stop(t+0.06);
+}
+function startMetro(r,t0,spb,countBeats,click){
+  let i=0;
+  const tick=()=>{
+    while(t0+i*spb<r.ac.currentTime+0.12){
+      if(i<countBeats||click)beep(r.ac,t0+i*spb,i%4===0);
+      i++;
+      if(i>=countBeats&&!click){clearInterval(r.metro);r.metro=null;return;}
+    }
+  };
+  r.metro=setInterval(tick,25);tick();
+}
+async function startRec(){
+  state='arming';clearClip();
+  try{
+    if(!window.AudioWorkletNode)throw new Error('BROWSER TOO OLD');
+    const ac=new (window.AudioContext||window.webkitAudioContext)({latencyHint:'interactive'});
+    const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+    await ac.resume();
+    const url=URL.createObjectURL(new Blob([WORKLET],{type:'text/javascript'}));
+    await ac.audioWorklet.addModule(url);URL.revokeObjectURL(url);
+    const src=ac.createMediaStreamSource(stream);
+    const node=new AudioWorkletNode(ac,'r',{numberOfOutputs:1,outputChannelCount:[1]});
+    const mute=ac.createGain();mute.gain.value=0;
+    src.connect(node);node.connect(mute);mute.connect(ac.destination);
+    if(navigator.storage&&navigator.storage.persist)navigator.storage.persist().catch(()=>{});
+
+    const bpm=getBpm(),spb=60/bpm,countBeats=optCount?4:0;
+    const t0=ac.currentTime+0.15,when=t0+countBeats*spb;
+    const sid=Date.now();
+    const sess={sid,startedAt:Date.now()+(when-ac.currentTime)*1000,take:$('take').value,loc:null};
+    const r=R={sid,sess,ac,stream,node,when,batch:[],batchBytes:0,idx:0,pending:Promise.resolve(),metro:null,timer:null,err:null,doneFn:null,spb};
+    await tx('readwrite',s=>s.put(sess),'sess');
+    node.port.onmessage=e=>onWorklet(r,e.data);
+    node.port.postMessage({when});
+    r.locP=getLoc().then(l=>{sess.loc=l;return tx('readwrite',s=>s.put(sess),'sess');}).catch(()=>{});
+    if(countBeats||optClick)startMetro(r,t0,spb,countBeats,optClick);
+    ac.onstatechange=()=>{if(R===r&&ac.state!=='running'&&ac.state!=='closed'){st('INTERRUPTED - RESUMING');ac.resume().catch(()=>{});}else if(R===r&&ac.state==='running'&&state==='rec')st('RECORDING');};
+
+    state=countBeats?'count':'rec';
+    $('rec').classList.toggle('cnt',!!countBeats);$('rec').classList.toggle('on',!countBeats);
+    $('rec').textContent=countBeats?'COUNT':'STOP';st(countBeats?'COUNT-IN':'RECORDING');
+    holdScreen();showInfo();
+    r.timer=setInterval(()=>{
+      const x=ac.currentTime-when;
+      if(x<0){if(state==='count')$('rec').textContent='COUNT '+Math.ceil(-x/spb);$('t').textContent='00:00';return;}
+      if(state==='count'){state='rec';$('rec').classList.remove('cnt');$('rec').classList.add('on');$('rec').textContent='STOP';st('RECORDING');}
+      $('t').textContent=clock(x);
+    },50);
+  }catch(e){
+    state='idle';
+    if(R&&R.stream)R.stream.getTracks().forEach(x=>x.stop());
+    R=null;
+    st('CANNOT RECORD: '+e.message);
+  }
+}
+async function stopRec(){
+  const r=R;state='saving';
+  $('rec').classList.remove('on','cnt');$('rec').textContent='SAVING';st('SAVING');
+  clearInterval(r.timer);if(r.metro)clearInterval(r.metro);freeScreen();
+  r.node.port.onmessage=e=>{if(e.data.peak===undefined)onWorklet(r,e.data);};$('bar').style.width='0';
+  await within(new Promise(res=>{r.doneFn=res;r.node.port.postMessage('stop');}),1500);
+  r.stream.getTracks().forEach(x=>x.stop());
+  commitBatch(r);await r.pending;
+  r.ac.close().catch(()=>{});
+  await within(r.locP,10000);
+  R=null;
+  try{
+    if(!r.idx){await dropSession(r.sid);state='idle';$('rec').textContent='REC';st('CANCELLED');showLevel(0);showInfo();return;}
+    if(r.err)throw r.err;
+    await finalise(r.sess,false);
+    $('take').value='';
+    state='idle';$('rec').textContent='REC';showInfo();
+    if(tokenOK()&&folderId)flush();else st('SAVED ON DEVICE - TAP CONNECT DRIVE');
+  }catch(e){
+    state='idle';$('rec').textContent='REC';showInfo();
+    st('SAVE FAIL: '+e.message+' - REOPEN APP TO RECOVER');
+  }
+}
+// Joins the saved chunks into one WAV and removes them in a single step.
+async function finalise(sess,recovered){
+  const chunks=await tx('readonly',s=>s.getAll(chunkRange(sess.sid)),'chunks');
+  if(!chunks.length||!sess.sr){await dropSession(sess.sid);return false;}
+  const bytes=chunks.reduce((a,c)=>a+c.blob.size,0);
+  const blob=new Blob([wavHeader(bytes,sess.sr,sess.ch),...chunks.map(c=>c.blob)],{type:'audio/wav'});
+  const name=fileName(await nextSerial(),sess,recovered);
+  const db=await dbp;
+  await new Promise((res,rej)=>{
+    const t=db.transaction(['f','chunks','sess'],'readwrite');
+    t.objectStore('f').put({name,blob,up:false,loc:sess.loc});
+    t.objectStore('chunks').delete(chunkRange(sess.sid));
+    t.objectStore('sess').delete(sess.sid);
+    t.oncomplete=res;t.onerror=t.onabort=()=>rej(t.error);
+  });
+  await render();
+  return true;
+}
+async function recoverAll(){
+  let n=0;
+  for(const s of await tx('readonly',x=>x.getAll(),'sess')){
+    try{if(await finalise(s,true))n++;}catch(e){}
+  }
+  if(n)st('RECOVERED '+n+' UNFINISHED RECORDING'+(n>1?'S':''));
+  return n;
+}
+$('rec').onclick=()=>{
+  if(state==='idle'){startRec();return;}
+  if(state==='rec'||state==='count'){
+    // this tap also lets Google refresh an expired login without blocking the popup
+    if(lsGet('rec_connected')==='1'&&!tokenOK())connect(true);
+    stopRec();
+  }
+};
+addEventListener('beforeunload',e=>{if(state==='rec'||state==='count'){e.preventDefault();e.returnValue='';}});
 
 // ---- player ----
 const au=new Audio();
@@ -228,7 +472,22 @@ async function render(){
   }
   mark();
 }
-render();
+
+// ---- start up ----
+(async()=>{
+  await render();
+  const n=await recoverAll();
+  try{
+    const s=JSON.parse(lsGet('rec_token')||'null');
+    if(s&&s.t&&Date.now()<s.e-60000){
+      token=s.t;tokenExp=s.e;
+      folderId=await getFolder();
+      if(!n)note('DRIVE OK');
+      flush();
+    }
+  }catch(e){}
+  driveLabel();
+})();
 if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js');
 </script>
 </body>
