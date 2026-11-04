@@ -7,13 +7,23 @@
 <link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#000000">
 <style>
-body{margin:0;background:#0b0b0b;color:#9f9;font-family:monospace;padding:16px}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;background:#0b0b0b;color:#9f9;font-family:monospace;padding:16px 16px 190px}
 button{font-family:monospace;background:#111;color:#9f9;border:1px solid #9f9;padding:12px;font-size:16px}
 #rec{width:100%;font-size:28px;padding:24px;margin:12px 0}
 #rec.on{background:#300;color:#f55;border-color:#f55}
 #t{font-size:32px;text-align:center;margin-top:12px}
 ul{padding:0}li{list-style:none;border-bottom:1px solid #222;padding:8px 0}
+li.cur .nm{color:#fff}
+.nm{overflow-wrap:anywhere}
 small{color:#686}
+#pl{position:fixed;left:0;right:0;bottom:0;background:#111;border-top:1px solid #9f9;padding:10px 16px}
+#plName{overflow-wrap:anywhere;font-size:13px}
+#seek{width:100%;margin:8px 0;accent-color:#9f9}
+#plTime{text-align:center;font-size:14px}
+#btns{display:flex;gap:6px;margin-top:6px}
+#btns button{flex:1;padding:12px 2px;font-size:14px;min-width:0}
 </style>
 </head>
 <body>
@@ -22,13 +32,28 @@ small{color:#686}
 <div id="t">00:00</div>
 <button id="rec">REC</button>
 <ul id="list"></ul>
+<div id="pl" hidden>
+  <div id="plName"></div>
+  <input id="seek" type="range" min="0" max="1000" value="0" aria-label="Seek">
+  <div id="plTime">00:00 / 00:00</div>
+  <div id="btns">
+    <button id="bPrev">PREV</button>
+    <button id="bBack">-10S</button>
+    <button id="bPlay">PLAY</button>
+    <button id="bFwd">+10S</button>
+    <button id="bNext">NEXT</button>
+    <button id="bStop">STOP</button>
+  </div>
+</div>
 <script src="https://accounts.google.com/gsi/client" async></script>
 <script>
 const CLIENT_ID='565577680506-j8u91f1tumfhvgne4ndv18djdsd86g38.apps.googleusercontent.com';
 const FOLDER_NAME='REC';
-let token=null,folderId=null,mr=null,chunks=[],t0=0,timer=null;
+let token=null,folderId=null,mr=null,chunks=[],t0=0,timer=null,memSerial=0;
 const $=id=>document.getElementById(id);
 const st=s=>$('st').textContent=s;
+const pad=(n,w=2)=>String(n).padStart(w,'0');
+const clock=s=>{s=Math.max(0,Math.floor(s||0));return pad(s/60|0)+':'+pad(s%60);};
 
 // ---- local storage (IndexedDB) ----
 const dbp=new Promise(res=>{const o=indexedDB.open('rec',1);o.onupgradeneeded=()=>o.result.createObjectStore('f',{keyPath:'name'});o.onsuccess=()=>res(o.result);});
@@ -49,41 +74,94 @@ async function getFolder(){
   const f=await api('https://www.googleapis.com/drive/v3/files',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:FOLDER_NAME,mimeType:'application/vnd.google-apps.folder'})});
   return f.id;
 }
-async function upload(name,blob){
+async function upload(f){
+  const meta={name:f.name,parents:[folderId]};
+  if(f.loc)meta.description='Location: '+(f.loc.place?f.loc.place+' | ':'')+f.loc.lat+', '+f.loc.lon;
   const fd=new FormData();
-  fd.append('metadata',new Blob([JSON.stringify({name,parents:[folderId]})],{type:'application/json'}));
-  fd.append('file',blob);
+  fd.append('metadata',new Blob([JSON.stringify(meta)],{type:'application/json'}));
+  fd.append('file',f.blob);
   return api('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',{method:'POST',body:fd});
 }
 async function flush(){
   if(!token||!folderId)return;
   for(const f of await all()){
     if(f.up)continue;
-    try{st('UPLOADING '+f.name);await upload(f.name,f.blob);f.up=true;await put(f);}
+    try{st('UPLOADING '+f.name);await upload(f);f.up=true;await put(f);await render();}
     catch(e){st('UPLOAD FAIL '+e.message+' (tap CONNECT DRIVE)');return;}
   }
   st('SYNCED');render();
 }
 
+// ---- serial number: continues from the highest number on this device or in Drive ----
+const serialOf=n=>{const m=/^(\d+)_/.exec(n);return m?+m[1]:0;};
+function savedSerial(){try{return +localStorage.getItem('rec_serial')||0;}catch(e){return 0;}}
+function saveSerial(n){memSerial=n;try{localStorage.setItem('rec_serial',String(n));}catch(e){}}
+async function driveMax(){
+  if(!token||!folderId)return 0;
+  let max=0,page='';
+  const q=encodeURIComponent(`'${folderId}' in parents and trashed=false`);
+  do{
+    const r=await api(`https://www.googleapis.com/drive/v3/files?pageSize=1000&fields=nextPageToken,files(name)&q=${q}`+(page?'&pageToken='+encodeURIComponent(page):''));
+    for(const f of r.files)max=Math.max(max,serialOf(f.name));
+    page=r.nextPageToken||'';
+  }while(page);
+  return max;
+}
+const within=(p,ms,fb)=>Promise.race([p,new Promise(r=>setTimeout(()=>r(fb),ms))]);
+async function nextSerial(){
+  let max=Math.max(savedSerial(),memSerial);
+  for(const f of await all())max=Math.max(max,serialOf(f.name));
+  max=Math.max(max,await within(driveMax().catch(()=>0),4000,0));
+  saveSerial(max+1);
+  return max+1;
+}
+
+// ---- location ----
+function getLoc(){return new Promise(res=>{
+  if(!navigator.geolocation)return res(null);
+  navigator.geolocation.getCurrentPosition(async p=>{
+    const lat=+p.coords.latitude.toFixed(4),lon=+p.coords.longitude.toFixed(4);
+    let place='';
+    try{
+      const c=new AbortController();setTimeout(()=>c.abort(),5000);
+      const r=await fetch(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=en`,{signal:c.signal});
+      const j=await r.json();
+      place=[...new Set([j.locality,j.city||j.principalSubdivision].filter(Boolean))].join(' ');
+    }catch(e){}
+    res({lat,lon,place});
+  },()=>res(null),{timeout:8000,maximumAge:300000});
+});}
+function locLabel(l){
+  if(!l)return 'NoLocation';
+  const p=(l.place||'').replace(/[^A-Za-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,40);
+  if(p)return p;
+  return Math.abs(l.lat)+(l.lat<0?'S':'N')+'-'+Math.abs(l.lon)+(l.lon<0?'W':'E');
+}
+function stamp(d){return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;}
+
 // ---- recording ----
+let locP=null,startedAt=null;
 $('rec').onclick=async()=>{
   if(mr&&mr.state==='recording'){mr.stop();return;}
-  const s=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
-  mr=new MediaRecorder(s);chunks=[];
+  let s;
+  try{s=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});}
+  catch(e){st('MIC BLOCKED: '+e.message);return;}
+  mr=new MediaRecorder(s);chunks=[];startedAt=new Date();locP=getLoc();
   mr.ondataavailable=e=>chunks.push(e.data);
   mr.onstop=async()=>{
     s.getTracks().forEach(x=>x.stop());clearInterval(timer);
     $('rec').classList.remove('on');$('rec').textContent='REC';st('ENCODING');
     try{
       const wav=await toWav(new Blob(chunks));
-      const name='REC_'+new Date().toISOString().replace(/[:.]/g,'-').slice(0,19)+'.wav';
-      await put({name,blob:wav,up:false});await render();
-      if(token&&folderId)flush();else st('SAVED ON PHONE - TAP CONNECT DRIVE');
+      const loc=await within(locP,10000,null);
+      const name=pad(await nextSerial(),4)+'_'+stamp(startedAt)+'_'+locLabel(loc)+'.wav';
+      await put({name,blob:wav,up:false,loc});await render();
+      if(token&&folderId)flush();else st('SAVED ON DEVICE - TAP CONNECT DRIVE');
     }catch(e){st('ENCODE FAIL: '+e.message);}
   };
   mr.start();t0=Date.now();
   $('rec').classList.add('on');$('rec').textContent='STOP';st('RECORDING');
-  timer=setInterval(()=>{const x=Math.floor((Date.now()-t0)/1000);$('t').textContent=String(x/60|0).padStart(2,'0')+':'+String(x%60).padStart(2,'0');},250);
+  timer=setInterval(()=>{$('t').textContent=clock((Date.now()-t0)/1000);},250);
 };
 
 // ---- convert to 16-bit WAV ----
@@ -100,17 +178,55 @@ async function toWav(blob){
   return new Blob([buf],{type:'audio/wav'});
 }
 
+// ---- player ----
+const au=new Audio();
+let files=[],cur=null,curUrl=null,seeking=false;
+function load(f,autoplay){
+  if(curUrl)URL.revokeObjectURL(curUrl);
+  curUrl=URL.createObjectURL(f.blob);cur=f.name;au.src=curUrl;
+  $('plName').textContent=f.name;$('pl').hidden=false;$('seek').value=0;
+  if(autoplay)au.play();
+  mark();
+}
+function mark(){for(const li of $('list').children)li.classList.toggle('cur',li.dataset.name===cur);}
+function step(d){
+  const i=files.findIndex(f=>f.name===cur);
+  const f=files[i+d];
+  if(f)load(f,true);
+}
+function jump(d){if(isFinite(au.duration))au.currentTime=Math.max(0,Math.min(au.duration,au.currentTime+d));}
+function closePlayer(){au.pause();au.removeAttribute('src');au.load();if(curUrl)URL.revokeObjectURL(curUrl);curUrl=null;cur=null;$('pl').hidden=true;mark();}
+function showTime(){
+  const d=isFinite(au.duration)?au.duration:0;
+  $('plTime').textContent=clock(au.currentTime)+' / '+clock(d);
+  if(!seeking&&d)$('seek').value=au.currentTime/d*1000;
+}
+au.ontimeupdate=showTime;au.onloadedmetadata=showTime;
+au.onplay=()=>$('bPlay').textContent='PAUSE';
+au.onpause=()=>$('bPlay').textContent='PLAY';
+au.onended=()=>{au.currentTime=0;showTime();};
+$('bPlay').onclick=()=>au.paused?au.play():au.pause();
+$('bStop').onclick=()=>{au.pause();au.currentTime=0;showTime();};
+$('bBack').onclick=()=>jump(-10);
+$('bFwd').onclick=()=>jump(10);
+$('bPrev').onclick=()=>step(-1);
+$('bNext').onclick=()=>step(1);
+$('seek').oninput=()=>{seeking=true;if(isFinite(au.duration))$('plTime').textContent=clock($('seek').value/1000*au.duration)+' / '+clock(au.duration);};
+$('seek').onchange=()=>{seeking=false;if(isFinite(au.duration))au.currentTime=$('seek').value/1000*au.duration;};
+
 // ---- file list ----
 async function render(){
-  const fs=(await all()).sort((a,b)=>b.name.localeCompare(a.name));
+  files=(await all()).sort((a,b)=>serialOf(b.name)-serialOf(a.name)||b.name.localeCompare(a.name));
   $('list').innerHTML='';
-  for(const f of fs){
-    const li=document.createElement('li');
-    li.innerHTML=`${f.name} <small>${f.up?'[SYNCED]':'[PENDING]'}</small><br>`;
-    const p=document.createElement('button');p.textContent='PLAY';p.onclick=()=>new Audio(URL.createObjectURL(f.blob)).play();
-    const d=document.createElement('button');d.textContent='DEL';d.onclick=async()=>{if(confirm('Delete phone copy? (Drive copy stays)')){await tx('readwrite',s=>s.delete(f.name));render();}};
-    li.append(p,' ',d);$('list').append(li);
+  for(const f of files){
+    const li=document.createElement('li');li.dataset.name=f.name;
+    const nm=document.createElement('div');nm.className='nm';nm.textContent=f.name+' ';
+    const tag=document.createElement('small');tag.textContent=f.up?'[SYNCED]':'[PENDING]';nm.append(tag);
+    const p=document.createElement('button');p.textContent='PLAY';p.onclick=()=>load(f,true);
+    const d=document.createElement('button');d.textContent='DEL';d.onclick=async()=>{if(confirm('Delete device copy? (Drive copy stays)')){if(cur===f.name)closePlayer();await tx('readwrite',s=>s.delete(f.name));render();}};
+    li.append(nm,p,' ',d);$('list').append(li);
   }
+  mark();
 }
 render();
 if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js');
