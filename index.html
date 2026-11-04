@@ -24,7 +24,7 @@ small{color:#686}
 <ul id="list"></ul>
 <script src="https://accounts.google.com/gsi/client" async></script>
 <script>
-const CLIENT_ID='PASTE_YOUR_CLIENT_ID.apps.googleusercontent.com';
+const CLIENT_ID='565577680506-j8u91f1tumfhvgne4ndv18djdsd86g38.apps.googleusercontent.com';
 const FOLDER_NAME='REC';
 let token=null,folderId=null,mr=null,chunks=[],t0=0,timer=null;
 const $=id=>document.getElementById(id);
@@ -74,9 +74,12 @@ $('rec').onclick=async()=>{
   mr.onstop=async()=>{
     s.getTracks().forEach(x=>x.stop());clearInterval(timer);
     $('rec').classList.remove('on');$('rec').textContent='REC';st('ENCODING');
-    const wav=await toWav(new Blob(chunks));
-    const name='REC_'+new Date().toISOString().replace(/[:.]/g,'-').slice(0,19)+'.wav';
-    await put({name,blob:wav,up:false});render();flush();
+    try{
+      const wav=await toWav(new Blob(chunks));
+      const name='REC_'+new Date().toISOString().replace(/[:.]/g,'-').slice(0,19)+'.wav';
+      await put({name,blob:wav,up:false});await render();
+      if(token&&folderId)flush();else st('SAVED ON PHONE - TAP CONNECT DRIVE');
+    }catch(e){st('ENCODE FAIL: '+e.message);}
   };
   mr.start();t0=Date.now();
   $('rec').classList.add('on');$('rec').textContent='STOP';st('RECORDING');
